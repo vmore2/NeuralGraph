@@ -150,6 +150,10 @@ impl ChatMemoryConfig {
                 ("context_multi_query", _, _) if flag.is_some() => {
                     self.retrieval.context_multi_query = flag == Some(true)
                 }
+                ("context_evidence", _, _) if flag.is_some() => self.retrieval.context_evidence = flag == Some(true),
+                ("context_memory_chars", _, Some(n)) => self.retrieval.context_memory_chars = n,
+                ("context_passage_chars", _, Some(n)) if n >= 1 => self.retrieval.context_passage_chars = n,
+                ("context_evidence_scan", _, Some(n)) if n >= 1 => self.retrieval.context_evidence_scan = n,
                 ("temporal_prior", Some(v), _) if v.trim().parse::<f64>().is_ok_and(|w| w.is_finite() && w >= 0.0) => {
                     self.retrieval.temporal_prior = v.trim().parse().unwrap_or(0.0)
                 }

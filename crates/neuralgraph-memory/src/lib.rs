@@ -18,6 +18,7 @@ pub mod clock;
 pub mod control;
 pub mod difflib;
 pub mod error;
+pub mod evidence;
 pub mod extraction;
 pub mod graph;
 pub mod hook;

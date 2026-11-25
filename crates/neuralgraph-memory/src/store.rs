@@ -1117,6 +1117,25 @@ impl ChatMemoryStore {
         self.with_conn(|c| Self::query_messages(c, &sql, &args))
     }
 
+    /// Every message in scope (chat and speaker filters only), oldest first: `sent_at`, then chat and position, undated
+    /// first as SQLite sorts NULL. `None` when more than `limit` match, so a caller can switch to keyword candidates.
+    pub fn messages_in_order(&self, f: &ChannelFilter, limit: i64) -> Result<Option<Vec<ChatMessage>>> {
+        let mut sql = "SELECT * FROM messages WHERE 1=1".to_string();
+        let mut args = Vec::new();
+        if let Some(s) = non_empty(&f.chat_id) {
+            sql.push_str(" AND chat_id = ?");
+            args.push(text_v(s));
+        }
+        if let Some(s) = non_empty(&f.speaker) {
+            sql.push_str(" AND speaker = ?");
+            args.push(text_v(s));
+        }
+        sql.push_str(" ORDER BY sent_at, chat_id, seq LIMIT ?");
+        args.push(SqlValue::Integer(limit + 1));
+        let rows = self.with_conn(|c| Self::query_messages(c, &sql, &args))?;
+        Ok((rows.len() as i64 <= limit).then_some(rows))
+    }
+
     /// Messages by id, in the order of the (deduplicated) ids given.
     pub fn get_messages_by_ids(&self, message_ids: &[String]) -> Result<Vec<ChatMessage>> {
         let ids = dedup(message_ids.iter().cloned());

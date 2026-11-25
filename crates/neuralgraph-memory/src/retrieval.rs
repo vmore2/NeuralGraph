@@ -15,6 +15,7 @@
 //! Every result carries its provenance (source messages) and a per-channel breakdown.
 
 use crate::error::Result;
+use crate::evidence;
 use crate::llm::LlmClient;
 use crate::models::{parse_iso, total_seconds, utcnow, ChatMessage, Memory, RetrievedMemory};
 use crate::pycompat::{fnum, obj, py_fixed, py_len, py_prefix, py_round, py_strip};
@@ -100,6 +101,21 @@ pub struct RetrievalConfig {
     /// time among the candidates, 0 oldest .. 1 newest), "first / earliest" toward the oldest. The factor shows as
     /// the `temporal` channel.
     pub temporal_prior: f64,
+    /// opt-in evidence passages (default false; env token `context_evidence`): replaces episodic recall with dated
+    /// sentence-window passages from user and assistant messages, ranked by BM25 fused with the provenance of the
+    /// block's memories and shown oldest first under [`crate::evidence::EVIDENCE_HEADER`] (see [`crate::evidence`]).
+    /// The Python prototype of this mode measured official 58 -> 66 and strict_v2 60 -> 74 (7:0) on LongMemEval-50
+    /// seed 1, the development draw; held-out draws are in research/reports.
+    pub context_evidence: bool,
+    /// with `context_evidence`: characters kept from the memory lines and their quotes, so passages always get the
+    /// rest of `context_max_chars` (0 = no separate cap). 2400 was the measured setting.
+    pub context_memory_chars: usize,
+    /// with `context_evidence`: longest passage, in characters (320 was the measured setting)
+    pub context_passage_chars: usize,
+    /// with `context_evidence`: passages are scored over every message in scope while there are at most this many;
+    /// beyond it, over the FTS keyword candidates plus the messages that sourced the block's memories, so the cost
+    /// stays bounded on a large store
+    pub context_evidence_scan: usize,
 }
 
 impl Default for RetrievalConfig {
@@ -130,6 +146,10 @@ impl Default for RetrievalConfig {
             context_raw_include_assistant: false,
             context_multi_query: false,
             temporal_prior: 0.0,
+            context_evidence: false,
+            context_memory_chars: 0,
+            context_passage_chars: 320,
+            context_evidence_scan: 5000,
         }
     }
 }
@@ -1073,7 +1093,7 @@ impl MemoryRetriever {
             self.search(query, &opts).await?
         };
         if results.is_empty() {
-            return Ok((String::new(), Vec::new()));
+            return self.no_memory_context(query, max_chars, filters);
         }
         // evidence floor: a line needs a keyword or graph hit, or a reasonably similar embedding
         let results: Vec<RetrievedMemory> = results
@@ -1085,7 +1105,7 @@ impl MemoryRetriever {
             })
             .collect();
         if results.is_empty() {
-            return Ok((String::new(), Vec::new()));
+            return self.no_memory_context(query, max_chars, filters);
         }
         let top_score = if results[0].score != 0.0 { results[0].score } else { 1.0 };
         let results: Vec<RetrievedMemory> =
@@ -1113,7 +1133,7 @@ impl MemoryRetriever {
             included.push(r);
         }
         if lines.len() == 1 {
-            return Ok((String::new(), Vec::new()));
+            return self.no_memory_context(query, max_chars, filters);
         }
         let mut seen = IndexSet::new();
         let mut quotes: Vec<Vec<String>> = vec![Vec::new(); lines.len()];
@@ -1125,10 +1145,88 @@ impl MemoryRetriever {
             out.push(line);
             out.extend(q);
         }
+        if cfg.context_evidence {
+            // evidence passages replace episodic recall (they include the human turns it would pick)
+            return self.evidence_context(query, filters, limit, &out.join("\n"), included);
+        }
         if cfg.context_raw_messages > 0 {
             self.append_raw_messages(query, filters, limit, used, &seen, &mut out)?;
         }
         Ok((out.join("\n"), included))
+    }
+
+    /// The block when no memory makes it in: empty, or evidence passages alone when `context_evidence` is on.
+    fn no_memory_context(
+        &self,
+        query: &str,
+        max_chars: Option<usize>,
+        filters: &SearchOptions,
+    ) -> Result<(String, Vec<RetrievedMemory>)> {
+        if !self.config.context_evidence {
+            return Ok((String::new(), Vec::new()));
+        }
+        let limit = max_chars.filter(|m| *m > 0).unwrap_or(self.config.context_max_chars);
+        self.evidence_context(query, filters, limit, "", Vec::new())
+    }
+
+    /// `context_evidence`: the memory block cut to `context_memory_chars`, then the best evidence passages in the
+    /// characters left (see [`crate::evidence`]).
+    fn evidence_context(
+        &self,
+        query: &str,
+        filters: &SearchOptions,
+        limit: usize,
+        memory_block: &str,
+        included: Vec<RetrievedMemory>,
+    ) -> Result<(String, Vec<RetrievedMemory>)> {
+        let cfg = &self.config;
+        let cap = if cfg.context_memory_chars > 0 { cfg.context_memory_chars } else { limit };
+        let memory_block = evidence::cap_memory_block(memory_block, cap);
+        // provenance: each message that sourced a block memory, with the best rank among the memories it sourced
+        let ids: Vec<String> = included.iter().map(|r| r.memory.memory_id.clone()).collect();
+        let sources: HashMap<String, Vec<String>> = self
+            .store
+            .get_memories_by_ids(&ids, true)?
+            .into_iter()
+            .map(|m| (m.memory_id, m.source_message_ids))
+            .collect();
+        let mut provenance: HashMap<String, usize> = HashMap::new();
+        for (rank, id) in ids.iter().enumerate() {
+            for mid in sources.get(id).into_iter().flatten() {
+                provenance.entry(mid.clone()).and_modify(|r| *r = (*r).min(rank)).or_insert(rank);
+            }
+        }
+        let filter =
+            ChannelFilter { chat_id: filters.chat_id.clone(), speaker: filters.speaker.clone(), ..Default::default() };
+        let scan = cfg.context_evidence_scan.max(1) as i64;
+        let messages = match self.store.messages_in_order(&filter, scan)? {
+            Some(all) => all,
+            None => {
+                // large store: keyword candidates plus the sourcing messages, in the same chronological order
+                let mut ids: Vec<String> = self
+                    .store
+                    .message_keyword_candidates(&normalize_ws(query), scan, &filter)?
+                    .into_iter()
+                    .map(|h| h.0)
+                    .collect();
+                ids.extend(provenance.keys().cloned());
+                let mut ms = self.store.get_messages_by_ids(&ids)?;
+                ms.sort_by(|a, b| (&a.sent_at, &a.chat_id, a.seq).cmp(&(&b.sent_at, &b.chat_id, b.seq)));
+                ms
+            }
+        };
+        let messages: Vec<evidence::EvidenceMessage> = messages
+            .into_iter()
+            .map(|m| evidence::EvidenceMessage {
+                message_id: m.message_id,
+                role: m.role,
+                sent_at: m.sent_at.unwrap_or_default(),
+                text: m.text,
+            })
+            .collect();
+        let budget = evidence::evidence_budget(limit, &memory_block);
+        let lines = evidence::select(&messages, query, &provenance, cfg.context_passage_chars, 1.0, budget);
+        Ok((evidence::compose(&memory_block, &lines), included))
     }
 
     /// Source quotes under each included memory line. Spends only what the memory lines left over.

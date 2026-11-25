@@ -679,6 +679,75 @@ async fn test_context_raw_spends_leftover_budget_only() {
     assert!(raw_section(&slack).len() < 3);
 }
 
+// ------------------------------------------------------------------------------------------ evidence passages
+
+fn ev_cfg() -> RetrievalConfig {
+    RetrievalConfig { context_evidence: true, context_memory_chars: 2400, ..Default::default() }
+}
+
+fn ev_section(block: &str) -> Vec<&str> {
+    let lines: Vec<&str> = block.lines().collect();
+    match lines.iter().position(|l| *l == neuralgraph_memory::evidence::EVIDENCE_HEADER) {
+        Some(at) => lines[at + 1..].to_vec(),
+        None => Vec::new(),
+    }
+}
+
+#[tokio::test]
+async fn test_context_evidence_is_off_by_default() {
+    let d = RetrievalConfig::default();
+    assert_eq!(
+        (d.context_evidence, d.context_memory_chars, d.context_passage_chars, d.context_evidence_scan),
+        (false, 0, 320, 5000)
+    );
+    let block = raw_fx(raw_cfg(3)).ret.context_for(Q, None, None, &SearchOptions::default()).await.unwrap();
+    assert!(block.contains(RAW_HDR) && ev_section(&block).is_empty(), "{block}");
+}
+
+#[tokio::test]
+async fn test_context_evidence_replaces_raw_messages_after_the_memory_lines() {
+    let none = SearchOptions::default();
+    let memories_only = raw_fx(raw_cfg(0)).ret.context_for(Q, None, None, &none).await.unwrap();
+    let on = raw_fx(ev_cfg()).ret.context_for(Q, None, None, &none).await.unwrap();
+    let header = neuralgraph_memory::evidence::EVIDENCE_HEADER;
+    assert!(on.starts_with(&format!("{memories_only}\n{header}\n")), "{on}");
+    assert!(!on.contains(RAW_HDR), "{on}");
+    let ev = ev_section(&on);
+    // dated and role-tagged, oldest first, whole sentences rejoined across the stored line break
+    assert!(ev.iter().all(|l| l.starts_with("- [2026-04-0") && l.ends_with('"')), "{on}");
+    assert!(ev.windows(2).all(|w| w[0][3..13] <= w[1][3..13]), "{on}");
+    assert!(ev.contains(&"- [2026-04-05 (Sun), user] \"My sister asked where I live now, and I said Osaka.\""), "{on}");
+    // assistant turns are evidence too (single-session-assistant questions ask about them)
+    assert!(ev.iter().any(|l| l.contains(", assistant] ")), "{on}");
+}
+
+#[tokio::test]
+async fn test_context_evidence_stays_within_budget_and_memory_cap() {
+    let none = SearchOptions::default();
+    for limit in [150, 300, 600, 1200] {
+        let block = raw_fx(ev_cfg()).ret.context_for(Q, None, Some(limit), &none).await.unwrap();
+        assert!(block.chars().count() <= limit, "{limit}: {block}");
+    }
+    // a memory cap below the first memory line leaves the whole budget to evidence
+    let cfg = RetrievalConfig { context_memory_chars: 10, ..ev_cfg() };
+    let block = raw_fx(cfg).ret.context_for(Q, None, None, &none).await.unwrap();
+    assert!(block.starts_with(neuralgraph_memory::evidence::EVIDENCE_HEADER), "{block}");
+}
+
+#[tokio::test]
+async fn test_context_evidence_honours_filters_and_bounds_the_scan() {
+    let other = SearchOptions { chat_id: Some("elsewhere".into()), ..Default::default() };
+    assert_eq!(raw_fx(ev_cfg()).ret.context_for(Q, None, None, &other).await.unwrap(), "");
+    // past the scan limit only keyword candidates and sourcing messages are scored; a passage matches the question
+    // whatever the corpus statistics, so the lines are a subset of the full scan's
+    let none = SearchOptions::default();
+    let full = raw_fx(ev_cfg()).ret.context_for(Q, None, None, &none).await.unwrap();
+    let cfg = RetrievalConfig { context_evidence_scan: 2, ..ev_cfg() };
+    let bounded = raw_fx(cfg).ret.context_for(Q, None, None, &none).await.unwrap();
+    assert!(!ev_section(&bounded).is_empty(), "{bounded}");
+    assert!(ev_section(&bounded).iter().all(|l| ev_section(&full).contains(l)), "{bounded}\n---\n{full}");
+}
+
 #[test]
 fn test_env_tokens_for_context_raw() {
     let mut cfg = ChatMemoryConfig::default();
@@ -940,5 +1009,23 @@ mod temporal_prior {
         assert_eq!(cfg.retrieval.temporal_prior, 0.5, "malformed values are ignored");
         cfg.apply_exp("temporal_prior=0");
         assert_eq!(cfg.retrieval.temporal_prior, 0.0);
+    }
+
+    #[test]
+    fn test_env_tokens_for_evidence_passages() {
+        let mut cfg = ChatMemoryConfig::default();
+        cfg.apply_exp("context_evidence,context_memory_chars=2400,context_passage_chars=200,context_evidence_scan=50");
+        let r = &cfg.retrieval;
+        assert_eq!(
+            (r.context_evidence, r.context_memory_chars, r.context_passage_chars, r.context_evidence_scan),
+            (true, 2400, 200, 50)
+        );
+        cfg.apply_exp("context_evidence=0,context_passage_chars=0,context_evidence_scan=0");
+        let r = &cfg.retrieval;
+        assert_eq!(
+            (r.context_evidence, r.context_passage_chars, r.context_evidence_scan),
+            (false, 200, 50),
+            "0 is ignored"
+        );
     }
 }
