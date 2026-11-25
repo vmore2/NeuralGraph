@@ -27,6 +27,14 @@ Pooled over the 100 held-out questions the routed protocol beats the original 22
 (LEDGER `PRODUCT-answer`). LoCoMo, sessions 1-8 of conversations 0-3 (168 questions): routed vs previous protocol strict 18 wins : 12
 losses, i.e. neutral to mildly positive. Read sec. 4 before comparing any of these with vendor numbers.
 
+Opt-in since: **evidence passages** (`NEURALGRAPH_EXP=context_evidence,context_memory_chars=2400` on `chat-memory-context`
+or any `neuralgraph-memory` run): the block keeps the memory lines and quotes up to 2400 characters, then fills the rest of
+the 6000 with dated, verbatim sentence windows from user and assistant messages (BM25 fused with memory provenance,
+oldest first) in place of the three episodic user turns. Same 150 questions with the switch off and on, official judge:
+Qwen3.5-4B reader 62.0 -> 71.3 (19:5, p 0.007), gemini-3.5-flash-lite 65.3 -> 73.3 (20:8, p 0.036); held-out seeds 2-3
++10.0 and +7.0. Off by default, so the table above reproduces unchanged. Commands and per-question rows:
+`research/reports/E1_evidence_passages.md`, `research/results/evidence_passages/`.
+
 ## 2. Prerequisites (as used)
 
 - LM Studio models, all pinned (a JIT-loaded model is unloaded after 60 min idle and fails with HTTP 400 under load):

@@ -28,3 +28,9 @@ those files live now.
 | [`N5_judge_sensitivity.md`](N5_judge_sensitivity.md) | How much does the grader decide the score? | **51-point spread** |
 | [`QUERY_ROUTING.md`](QUERY_ROUTING.md) | The hashtable marker system for query routing | — |
 | [`P_paper_framing.md`](P_paper_framing.md) | Venue fit and framing | — |
+
+Later reports run on the Rust crates and the `research/overnight/` harness:
+
+| Report | Question | Verdict |
+|---|---|---|
+| [`E1_evidence_passages.md`](E1_evidence_passages.md) | Dated verbatim passages instead of episodic recall in the context block? | **works** (+9.3 / +8.0 official, LongMemEval Oracle 150, two readers) |
